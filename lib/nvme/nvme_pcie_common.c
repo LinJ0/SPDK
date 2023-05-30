@@ -635,6 +635,12 @@ nvme_pcie_qpair_submit_tracker(struct spdk_nvme_qpair *qpair, struct nvme_tracke
 			  (uint32_t)req->cmd.cid, (uint32_t)req->cmd.opc,
 			  req->cmd.cdw10, req->cmd.cdw11, req->cmd.cdw12);
 
+    // nvme_io tracepoint
+    uint32_t admin = (qpair == ctrlr->adminq) ? 1 : 0;
+    spdk_trace_record(TRACE_NVME_IO_SUBMIT, qpair->id, 0, (uintptr_t)req,
+    (uint32_t)admin, (uint32_t)req->cmd.opc, (uint32_t)req->cmd.cid, (uint32_t)req->cmd.nsid,
+    (uint32_t)req->cmd.cdw10, (uint32_t)req->cmd.cdw11, (uint32_t)req->cmd.cdw12, (uint32_t)req->cmd.cdw13);
+
 	if (req->cmd.fuse) {
 		/*
 		 * Keep track of the fuse operation sequence so that we ring the doorbell only
@@ -680,6 +686,11 @@ nvme_pcie_qpair_complete_tracker(struct spdk_nvme_qpair *qpair, struct nvme_trac
 
 	spdk_trace_record(TRACE_NVME_PCIE_COMPLETE, qpair->id, 0, (uintptr_t)req, req->cb_arg,
 			  (uint32_t)req->cmd.cid, (uint32_t)cpl->status_raw);
+    
+    // nvme_io tracepoint
+    uint32_t admin = (qpair == qpair->ctrlr->adminq) ? 1 : 0;
+    spdk_trace_record(TRACE_NVME_IO_COMPLETE, qpair->id, 0, (uintptr_t)req,
+        (uint32_t)admin, (uint32_t)req->cmd.cid, (uint32_t)cpl->status_raw);
 
 	assert(req != NULL);
 
@@ -1844,4 +1855,35 @@ SPDK_TRACE_REGISTER_FN(nvme_pcie, "nvme_pcie", TRACE_GROUP_NVME_PCIE)
 	spdk_trace_register_object(OBJECT_NVME_PCIE_REQ, 'p');
 	spdk_trace_register_owner(OWNER_NVME_PCIE_QP, 'q');
 	spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
+}
+
+SPDK_TRACE_REGISTER_FN(nvme_io, "nvme_io", TRACE_GROUP_NVME_IO)
+{
+    struct spdk_trace_tpoint_opts opts[] = {
+        {    
+            "NVME_IO_SUBMIT", TRACE_NVME_IO_SUBMIT,
+            OWNER_NVME_IO, OBJECT_NVME_IO, 1,
+            {   { "admin", SPDK_TRACE_ARG_TYPE_INT, 4 },
+                { "opc", SPDK_TRACE_ARG_TYPE_INT, 4 },
+                { "cid", SPDK_TRACE_ARG_TYPE_PTR, 4 },
+                { "nsid", SPDK_TRACE_ARG_TYPE_PTR, 4 }, 
+                { "cdw10", SPDK_TRACE_ARG_TYPE_PTR, 4 }, 
+                { "cdw11", SPDK_TRACE_ARG_TYPE_PTR, 4 },
+                { "cdw12", SPDK_TRACE_ARG_TYPE_PTR, 4 },
+                { "cdw13", SPDK_TRACE_ARG_TYPE_PTR, 4 }
+            }    
+        },   
+        {    
+            "NVME_IO_COMPLETE", TRACE_NVME_IO_COMPLETE,
+            OWNER_NVME_IO, OBJECT_NVME_IO, 0,
+            {   { "admin", SPDK_TRACE_ARG_TYPE_INT, 4 },
+                { "cid", SPDK_TRACE_ARG_TYPE_INT, 4 }, 
+                { "cpl", SPDK_TRACE_ARG_TYPE_PTR, 4 }
+            }    
+        },   
+    };   
+
+    spdk_trace_register_object(OBJECT_NVME_IO, 'p');
+    spdk_trace_register_owner(OWNER_NVME_IO, 'q');
+    spdk_trace_register_description_ext(opts, SPDK_COUNTOF(opts));
 }
