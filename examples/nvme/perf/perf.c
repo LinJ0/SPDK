@@ -24,6 +24,7 @@
 #include "spdk/likely.h"
 #include "spdk/sock.h"
 #include "spdk/zipf.h"
+#include "spdk/trace.h"
 
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
@@ -300,6 +301,165 @@ static TAILQ_HEAD(, trid_entry) g_trid_list = TAILQ_HEAD_INITIALIZER(g_trid_list
 static int g_file_optind; /* Index of first filename in argv */
 
 static inline void task_complete(struct perf_task *task);
+
+/* enable SPDK trace tool */
+static bool g_spdk_trace = false;
+static const char *g_tpoint_group_name = NULL;
+static bool g_spdk_trace_record = false;
+
+static int
+enable_spdk_trace(const char *app_name, const char *tpoint_group_name)
+{
+    bool error_found = false;
+
+    /* generate spdk trace file in /dev/shm/ */
+    char shm_name[64];
+    snprintf(shm_name, sizeof(shm_name), "/%s_trace.pid%d", app_name, (int)getpid());
+    if (spdk_trace_init(shm_name, SPDK_DEFAULT_NUM_TRACE_ENTRIES) != 0) {
+        return -1;
+    } 
+
+    if (tpoint_group_name == NULL) {
+        return 0;
+    }
+
+    char *tpoint_group_mask_str = NULL;
+    tpoint_group_mask_str = strdup(tpoint_group_name);
+    if (tpoint_group_mask_str == NULL) {
+        fprintf(stderr, "Unable to get string of tpoint group mask from opts.\n");
+        return -1;
+    }
+
+    char *tpoint_group_str = NULL;
+    char *tpoint_group, *tpoints;
+    uint64_t tpoint_group_mask;
+    uint64_t tpoint_mask = -1ULL;
+
+    /* Save a pointer to the original value of the tpoint group mask string
+     * to free later, because spdk_strsepq() modifies given char*. */
+    char *tp_g_str = tpoint_group_mask_str;
+    char *end = NULL;
+
+    while ((tpoint_group_str = spdk_strsepq(&tpoint_group_mask_str, ",")) != NULL) {
+        if (strchr(tpoint_group_str, ':')) {
+            /* Get the tpoint group mask */
+            tpoint_group = spdk_strsepq(&tpoint_group_str, ":");
+            /* Get the tpoint mask inside that group */
+            tpoints = spdk_strsepq(&tpoint_group_str, ":");
+
+            tpoint_group_mask = strtoull(tpoint_group, &end, 16);
+            if (*end != '\0') {
+                tpoint_group_mask = spdk_trace_create_tpoint_group_mask(tpoint_group);
+                if (tpoint_group_mask == 0) {
+                    error_found = true;
+                    break;
+                }
+            }
+            /* Check if tpoint group mask has only one bit set.
+             * This is to avoid enabling individual tpoints in
+             * more than one tracepoint group at once. */
+            if (!spdk_u64_is_pow2(tpoint_group_mask)) {
+                fprintf(stderr, "Tpoint group mask: %s contains multiple tpoint groups.\n", tpoint_group);
+                fprintf(stderr, "This is not supported, to prevent from activating tpoints by mistake.\n");
+                error_found = true;
+                break;
+            }
+
+            tpoint_mask = strtoull(tpoints, &end, 16);
+            if (*end != '\0') {
+                error_found = true;
+                break;
+            }
+        } else {
+            tpoint_group_mask = strtoull(tpoint_group_str, &end, 16);
+            if (*end != '\0') {
+                tpoint_group_mask = spdk_trace_create_tpoint_group_mask(tpoint_group_str);
+                if (tpoint_group_mask == 0) {
+                    error_found = true;
+                    break;
+                }
+            }
+            tpoint_mask = -1ULL;
+        }
+        for (uint64_t group_id = 0; group_id < SPDK_TRACE_MAX_GROUP_ID; ++group_id) {
+            if (tpoint_group_mask & (1 << group_id)) {
+                spdk_trace_set_tpoints(group_id, tpoint_mask);
+            }
+        }
+    }
+
+    if (error_found) {
+        fprintf(stderr, "invalid tpoint mask %s\n", tpoint_group_name);
+        free(tp_g_str);
+        return -1;
+    } else {
+        printf("Tracepoint Group Mask %s specified.\n", tpoint_group_name);
+        printf("Use 'spdk_trace -s %s -p %d' to capture a snapshot of events at runtime.\n",
+            app_name, getpid());
+#if defined(__linux__)
+        printf("Or copy /dev/shm%s for offline analysis/debug.\n", shm_name);
+#endif
+    }
+
+    free(tp_g_str);
+    return 0;
+}
+
+static void 
+sigint_handler(pid_t spdk_pid) 
+{
+    printf("spdk_trace_record receive SIGINT\n");
+
+    if (spdk_pid > 0) {
+        // send SIGINT to pid
+        if (kill(spdk_pid, SIGINT) == 0) {
+            printf("send SIGINT to spdk_trace_record\n");
+        } else {
+            fprintf(stderr, "Fail to send SIGINT to spdk_trace_record\n");
+        }
+    }
+}
+
+static pid_t
+enable_spdk_trace_record(const char *app_name, pid_t app_pid)
+{
+    /* register SIGINT signal handler function */
+    signal(SIGINT, sigint_handler);
+
+    char app_pid_str[32];
+    snprintf(app_pid_str, sizeof(app_pid_str), "%d", app_pid);
+    char spdk_trace_file[64];
+    snprintf(spdk_trace_file, sizeof(spdk_trace_file), "./%s_pid%d.trace", app_name, app_pid);
+
+    pid_t spdk_pid = fork();
+    if (spdk_pid < 0) {
+        fprintf(stderr, "spdk_trace_record fork() fail\n");
+        return 1;
+    } else if (spdk_pid == 0) {
+        printf("spdk_trace_record PID：%d\n", getpid());
+        /* execute spdk_trace_record */
+        char *args[] = {"/home/znsvm/spdk/build/bin/spdk_trace_record", "-q", 
+                        "-s", (char *)app_name, "-p", app_pid_str, 
+                        "-f", spdk_trace_file, NULL};
+        execvp(args[0], args);
+        
+        /* if success to execute spdk_trace_record, never go to here */
+        fprintf(stderr, "spdk_trace_record execvp() fail\n");
+        return 0;
+    }
+    return spdk_pid;
+}
+
+static int
+disable_spdk_trace_record(pid_t spdk_pid)
+{
+    if (spdk_pid == 0) {
+        return -1;
+    }
+    sigint_handler(spdk_pid);
+    return 0;
+}
+/* enable SPDK trace tool */
 
 static void
 perf_set_sock_opts(const char *impl_name, const char *field, uint32_t val, const char *valstr)
@@ -1792,6 +1952,8 @@ usage(char *program_name)
 	printf(" [Kernel device(s)]...");
 #endif
 	printf("\n");
+    printf("\t[-x, --spk-trace <tpoint> enable spdk trexe tool with tpoint \n");    
+    spdk_trace_mask_usage(stdout, "-x");
 	printf("\t[-b, --allowed-pci-addr <addr> allowed local PCIe device address]\n");
 	printf("\t Example: -b 0000:d8:00.0 -b 0000:d9:00.0\n");
 	printf("\t[-q, --io-depth <val> io depth]\n");
@@ -2285,9 +2447,13 @@ parse_metadata(const char *metacfg_str)
 	return 0;
 }
 
-#define PERF_GETOPT_SHORT "a:b:c:d:e:gi:lmo:q:r:k:s:t:w:z:A:C:DF:GHILM:NO:P:Q:RS:T:U:VZ:"
+#define PERF_GETOPT_SHORT "a:b:c:d:e:gi:lmo:q:r:k:s:t:w:x:yz:A:C:DF:GHILM:NO:P:Q:RS:T:U:VZ:"
 
 static const struct option g_perf_cmdline_opts[] = {
+#define SPDK_TRACE_TOOL    'x'
+    {"spdk_trace",         required_argument,  NULL, SPDK_TRACE_TOOL},
+#define SPDK_TRACE_RECORD    'y'
+    {"spdk_trace_record",         no_argument,  NULL, SPDK_TRACE_RECORD},
 #define PERF_WARMUP_TIME	'a'
 	{"warmup-time",			required_argument,	NULL, PERF_WARMUP_TIME},
 #define PERF_ALLOWED_PCI_ADDR	'b'
@@ -2403,6 +2569,13 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 
 	while ((op = getopt_long(argc, argv, PERF_GETOPT_SHORT, g_perf_cmdline_opts, &long_idx)) != -1) {
 		switch (op) {
+        case SPDK_TRACE_TOOL:
+            g_spdk_trace = true;
+            g_tpoint_group_name = optarg;
+            break;
+        case SPDK_TRACE_RECORD:
+            g_spdk_trace_record = true;
+            break;
 		case PERF_WARMUP_TIME:
 		case PERF_BUFFER_ALIGNMENT:
 		case PERF_SHMEM_GROUP_ID:
@@ -3091,6 +3264,16 @@ main(int argc, char **argv)
 	if (rc != 0) {
 		return rc;
 	}
+
+    /* SPDK trace tool */
+    if (g_spdk_trace) {
+        rc = enable_spdk_trace(opts.name, g_tpoint_group_name);
+        if (rc != 0) {
+            fprintf(stderr, "Failed to enable spdk trace\n");
+            return -1;
+        }
+    }
+
 	/* Transport statistics are printed from each thread.
 	 * To avoid mess in terminal, init and use mutex */
 	rc = pthread_mutex_init(&g_stats_mutex, NULL);
@@ -3163,6 +3346,15 @@ main(int argc, char **argv)
 
 	printf("Initialization complete. Launching workers.\n");
 
+    /* spdk_trace_record */
+    static pid_t spdk_pid = 0;
+    if (g_spdk_trace && g_spdk_trace_record) {
+        spdk_pid = enable_spdk_trace_record(opts.name, getpid());
+        if (spdk_pid == 0) {
+            fprintf(stderr, "Fail to exec spdk_trace_record\n");
+        }
+    }
+
 	/* Launch all of the secondary workers */
 	g_main_core = spdk_env_get_current_core();
 	main_worker = NULL;
@@ -3200,6 +3392,10 @@ cleanup:
 	if (rc != 0) {
 		fprintf(stderr, "%s: errors occurred\n", argv[0]);
 	}
+
+    if (g_spdk_trace && g_spdk_trace_record && spdk_pid != 0) {
+        disable_spdk_trace_record(spdk_pid);
+    }
 
 	return rc;
 }

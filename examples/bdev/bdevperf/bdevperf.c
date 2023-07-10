@@ -223,6 +223,65 @@ struct lcore_thread {
 TAILQ_HEAD(, lcore_thread) g_lcore_thread_list
 	= TAILQ_HEAD_INITIALIZER(g_lcore_thread_list);
 
+/* spdk_trace_record */
+static bool g_spdk_trace_record = false;
+static pid_t g_spdk_pid = 0;
+
+static void 
+sigint_handler(pid_t spdk_pid) 
+{
+    printf("spdk_trace_record receive SIGINT\n");
+
+    if (spdk_pid > 0) {
+        // send SIGINT to child_p2
+        if (kill(spdk_pid, SIGINT) == 0) {
+            printf("send SIGINT to spdk_trace_record\n");
+        } else {
+            fprintf(stderr, "Fail to send SIGINT to spdk_trace_record\n");
+        }
+    }
+}
+
+static pid_t
+enable_spdk_trace_record(const char *app_name, pid_t app_pid)
+{
+    /* register SIGINT signal handler function */
+    signal(SIGINT, sigint_handler);
+
+    char app_pid_str[32];
+    snprintf(app_pid_str, sizeof(app_pid_str), "%d", app_pid);
+    char spdk_trace_file[64];
+    snprintf(spdk_trace_file, sizeof(spdk_trace_file), "%s_pid%d.trace", app_name, app_pid);
+
+    pid_t spdk_pid = fork();
+    if (spdk_pid < 0) {
+        fprintf(stderr, "spdk_trace_record fork() fail\n");
+        return 1;
+    } else if (spdk_pid == 0) {
+        printf("spdk_trace_record PID：%d\n", getpid());
+        /* execute spdk_trace_record */
+        char *args[] = {"/home/znsvm/spdk/build/bin/spdk_trace_record", "-q", 
+                        "-s", (char *)app_name, "-p", app_pid_str, 
+                        "-f", spdk_trace_file, NULL};
+        execvp(args[0], args);
+        
+        /* if success to execute spdk_trace_record, never go to here */
+        fprintf(stderr, "spdk_trace_record execvp() fail\n");
+        return 0;
+    }
+    return spdk_pid;
+}
+
+static int
+disable_spdk_trace_record(pid_t spdk_pid)
+{
+    if (spdk_pid == 0) {
+        return -1;
+    }
+    sigint_handler(spdk_pid);
+    return 0;
+}
+
 /*
  * Cumulative Moving Average (CMA): average of all data up to current
  * Exponential Moving Average (EMA): weighted mean of the previous n data and more weight is given to recent
@@ -2327,6 +2386,13 @@ bdevperf_run(void *arg1)
 {
 	uint32_t i;
 
+    if (g_spdk_trace_record) {
+        g_spdk_pid = enable_spdk_trace_record("bdevperf", getpid());
+        if (g_spdk_pid == 0) {
+            fprintf(stderr, "Fail to exec spdk_trace_record\n");
+        }
+    }
+
 	g_main_thread = spdk_get_thread();
 
 	spdk_cpuset_zero(&g_all_cpuset);
@@ -2428,7 +2494,9 @@ bdevperf_parse_arg(int ch, char *arg)
 {
 	long long tmp;
 
-	if (ch == 'w') {
+    if (ch == 'a') {
+        g_spdk_trace_record = true;
+	} else if (ch == 'w') {
 		g_workload_type = optarg;
 	} else if (ch == 'T') {
 		g_job_bdev_name = optarg;
@@ -2525,6 +2593,7 @@ bdevperf_usage(void)
 	printf(" -l                        display latency histogram, default: disable. -l display summary, -ll display details\n");
 	printf(" -D                        use a random map for picking offsets not previously read or written (for all jobs)\n");
 	printf(" -E                        share per lcore thread among jobs. Available only if -j is not used.\n");
+    printf(" -a                        Enable spdk_trace_record.\n");
 }
 
 static int
@@ -2651,7 +2720,7 @@ main(int argc, char **argv)
 	opts.rpc_addr = NULL;
 	opts.shutdown_cb = spdk_bdevperf_shutdown_cb;
 
-	if ((rc = spdk_app_parse_args(argc, argv, &opts, "Zzfq:o:t:w:k:CEF:M:P:S:T:Xlj:D", NULL,
+	if ((rc = spdk_app_parse_args(argc, argv, &opts, "aZzfq:o:t:w:k:CEF:M:P:S:T:Xlj:D", NULL,
 				      bdevperf_parse_arg, bdevperf_usage)) !=
 	    SPDK_APP_PARSE_ARGS_SUCCESS) {
 		return rc;
@@ -2666,10 +2735,22 @@ main(int argc, char **argv)
 		free_job_config();
 		exit(1);
 	}
-
+/*
+    if (g_spdk_trace_record) {
+        g_spdk_pid = enable_spdk_trace_record("bdevperf", getpid());
+        if (g_spdk_pid == 0) {
+            fprintf(stderr, "Fail to exec spdk_trace_record\n");
+        }
+    }
+*/
 	rc = spdk_app_start(&opts, bdevperf_run, NULL);
 
 	spdk_app_fini();
 	free_job_config();
+    
+    if (g_spdk_trace_record && g_spdk_pid != 0) {
+        disable_spdk_trace_record(g_spdk_pid);
+    }
+
 	return rc;
 }
